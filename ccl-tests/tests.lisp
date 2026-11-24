@@ -75,3 +75,144 @@
             unless (eql got (* x d))
               collect x))
   nil)
+
+;;; (ccl::%alias-special ALIAS TARGET) makes ALIAS another name for the
+;;; special variable TARGET.  The tests use fresh uninterned symbols.
+(defun alias-test-pair (&optional (value nil value-p))
+  (let ((alias (make-symbol "ALIAS"))
+        (target (make-symbol "TARGET")))
+    (when value-p
+      (setf (symbol-value target) value))
+    (ccl::%alias-special alias target)
+    (values alias target)))
+
+(defun alias-test-in-thread (fn)
+  (ccl:join-process (ccl:process-run-function "alias-test" fn)))
+
+;;; The global value is shared, in both directions, including a SETQ done
+;;; by a thread that has no binding.
+(deftest ccl.alias-special.global-value
+    (multiple-value-bind (alias target) (alias-test-pair 1)
+      (list (symbol-value alias)
+            (progn (setf (symbol-value alias) 2) (symbol-value target))
+            (progn (setf (symbol-value target) 3) (symbol-value alias))
+            (progn (alias-test-in-thread
+                    (lambda () (eval `(setq ,alias 4))))
+                   (symbol-value target))
+            (progn (alias-test-in-thread
+                    (lambda () (eval `(setq ,target 5))))
+                   (symbol-value alias))
+            (alias-test-in-thread (lambda () (symbol-value alias)))))
+  (1 2 3 4 5 5))
+
+;;; If only the alias has a value when it is aliased, the target gets it.
+(deftest ccl.alias-special.alias-value-migrates
+    (let ((alias (make-symbol "ALIAS"))
+          (target (make-symbol "TARGET")))
+      (setf (symbol-value alias) 7)
+      (ccl::%alias-special alias target)
+      (list (symbol-value target) (symbol-value alias)))
+  (7 7))
+
+(deftest ccl.alias-special.boundp-makunbound
+    (multiple-value-bind (alias target) (alias-test-pair)
+      (let ((r '()))
+        (push (list (boundp alias) (boundp target)) r)
+        (set alias 1)
+        (push (list (boundp alias) (boundp target)) r)
+        (makunbound alias)
+        (push (list (boundp alias) (boundp target)) r)
+        (set target 2)
+        (makunbound target)
+        (push (list (boundp alias) (boundp target)) r)
+        (set target 3)
+        (push (list (symbol-value alias) (eval alias) (eval target)) r)
+        (nreverse r)))
+  ((nil nil) (t t) (nil nil) (nil nil) (3 3 3)))
+
+;;; A dynamic binding made through one name is seen through the other,
+;;; in the binding thread only.
+(deftest ccl.alias-special.binding
+    (multiple-value-bind (alias target) (alias-test-pair 0)
+      (list
+       (eval `(let ((,alias 1))
+                (declare (special ,alias))
+                (list (symbol-value ',alias) (symbol-value ',target)
+                      ,target ,alias
+                      (alias-test-in-thread
+                       (lambda () (symbol-value ',target))))))
+       (eval `(let ((,target 2))
+                (declare (special ,target))
+                (setq ,alias 3)
+                (list (symbol-value ',alias) ,target)))
+       (symbol-value alias)
+       (symbol-value target)))
+  ((1 1 1 1 0) (3 3) 0 0))
+
+(deftest ccl.alias-special.progv
+    (multiple-value-bind (alias target) (alias-test-pair 0)
+      (list (progv (list alias) '(1)
+              (list (symbol-value target) (symbol-value alias)))
+            (progv (list target) '(2)
+              (list (symbol-value target) (symbol-value alias)))
+            (symbol-value alias)))
+  ((1 1) (2 2) 0))
+
+;;; A function compiled after the aliasing refers to the shared variable.
+(deftest ccl.alias-special.compiled-code
+    (multiple-value-bind (alias target) (alias-test-pair 10)
+      (let ((read (compile nil `(lambda () ,alias)))
+            (write (compile nil `(lambda (v) (setq ,alias v))))
+            (bind (compile nil `(lambda (f)
+                                  (let ((,alias 20))
+                                    (declare (special ,alias))
+                                    (funcall f))))))
+        (list (funcall read)
+              (progn (funcall write 11) (symbol-value target))
+              (progn (setf (symbol-value target) 12) (funcall read))
+              (funcall bind (compile nil `(lambda () ,target)))
+              (funcall read))))
+  (10 11 12 20 12))
+
+;;; Aliasing an alias aliases its target.
+(deftest ccl.alias-special.chain
+    (let ((a (make-symbol "A"))
+          (b (make-symbol "B"))
+          (c (make-symbol "C")))
+      (ccl::%alias-special b c)
+      (ccl::%alias-special a b)
+      (setf (symbol-value a) 1)
+      (list (eq (ccl::%special-alias-target a) c)
+            (symbol-value b)
+            (symbol-value c)
+            (eq (ccl::%alias-special a c) a)))
+  (t 1 1 t))
+
+(deftest ccl.alias-special.errors
+    (let ((a (make-symbol "A"))
+          (b (make-symbol "B"))
+          (c (make-symbol "C")))
+      (ccl::%alias-special a b)
+      (flet ((errorp (fn)
+               (handler-case (progn (funcall fn) nil)
+                 (error () t))))
+        (list (errorp (lambda () (ccl::%alias-special a c)))
+              (errorp (lambda () (ccl::%alias-special b a)))
+              (errorp (lambda () (ccl::%alias-special c c)))
+              (errorp (lambda () (ccl::%alias-special c 'pi)))
+              (errorp (lambda () (ccl::%alias-special c :foo)))
+              (errorp (lambda () (ccl::%alias-special c nil)))
+              (errorp (lambda () (ccl::%alias-special 'pi c)))
+              (errorp (lambda () (ccl::%alias-special :foo c)))
+              (errorp (lambda () (ccl::%alias-special t c)))
+              (errorp (lambda () (ccl::%alias-special 1 c)))
+              ;; A symbol with a binding in effect cannot become an alias.
+              (let ((d (make-symbol "D")))
+                (funcall (eval `(lambda (fn)
+                                  (let ((,d 1))
+                                    (declare (special ,d))
+                                    (funcall fn))))
+                         (lambda ()
+                           (errorp (lambda () (ccl::%alias-special d c))))))
+              (eq (ccl::%special-alias-target a) b))))
+  (t t t t t t t t t t t t))
